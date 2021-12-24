@@ -34,36 +34,141 @@
 
 namespace xla {
 
+class DataHandleLocker {
+ public:
+  void Lock() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [this] { return !locked_; });
+    CheckResetException();
+    locked_ = true;
+  }
+
+  void Unlock(std::exception_ptr exptr) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    locked_ = false;
+    exptr_ = std::move(exptr);
+    cv_.notify_all();
+  }
+
+  void Barrier() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [this] { return !locked_; });
+    cv_.notify_all();
+    CheckResetException();
+  }
+
+ private:
+  void CheckResetException() {
+    std::exception_ptr exptr = std::move(exptr_);
+    exptr_ = nullptr;
+    if (exptr != nullptr) {
+      std::rethrow_exception(exptr);
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool locked_ = false;
+  std::exception_ptr exptr_;
+};
+
 class XrtComputationClient : public ComputationClient {
   struct DeviceHandle {
     std::string device;
     int64_t handle;
   };
 
-  struct XrtHandle {
-    XrtHandle(int64_t handle, std::function<void()> releaser)
-        : handle(handle), releaser(std::move(releaser)) {}
+  class XrtHandle {
+   public:
+    XrtHandle(int64_t handle, std::function<void(int64_t)> releaser,
+              bool async = false)
+        : handle_(handle), releaser(std::move(releaser)) {
+      if (async) {
+        locker = std::make_shared<DataHandleLocker>();
+      } else {
+        locker = nullptr;
+      }
+    }
 
-    ~XrtHandle() { releaser(); }
+    ~XrtHandle() {
+      // Handle might only contain dummy value, need to wait for the
+      // true handle assigniment
+      if (locker) {
+        locker->Barrier();
+      }
+      releaser(handle_);
+    }
 
-    int64_t handle;
-    std::function<void()> releaser;
+    // Lock the current XrtHandle and prevent other caller from accessign the
+    // handle_ value. This function will return an ExceptionCleanup object which
+    // will rethrow the exception if there is one and unlock the XrtHandle upon
+    // destruction.
+    xla::util::ExceptionCleanup LockHandle() {
+      std::shared_ptr<DataHandleLocker> locker_copy = this->locker;
+      locker_copy->Lock();
+      return xla::util::ExceptionCleanup(
+          [locker_copy = std::move(locker_copy)](
+              xla::util::ExceptionCleanup::StatusType status) {
+            locker_copy->Unlock(std::move(status));
+          });
+    }
+
+    void update_handle(int64_t handle) {
+      // TODO: check for defualt value before upadating.
+      handle_ = handle;
+    }
+
+    int64_t handle() {
+      // Handle might only contain dummy value, need to wait for the
+      // true handle assigniment
+      if (locker) {
+        locker->Barrier();
+      }
+      return handle_;
+      ;
+    }
+
+   private:
+    int64_t handle_;
+    std::shared_ptr<DataHandleLocker> locker;
+    std::function<void(int64_t)> releaser;
   };
 
   using XrtHandlePtr = std::shared_ptr<XrtHandle>;
 
+  struct AsynHandle {
+    // void Wait();
+
+    std::vector<xla::util::ExceptionCleanup> unlockers;
+    std::vector<XrtHandlePtr> handles;
+  };
+
   struct XrtData : public Data {
     XrtData(std::string device, Shape device_shape)
         : Data(std::move(device), std::move(device_shape)) {}
+    // XrtData(XrtComputationClient* self, std::string device, Shape
+    // device_shape,
+    //         int64_t handle)
+    //     : Data(std::move(device), std::move(device_shape)),
+    //       handle_ptr(std::make_shared<XrtHandle>(
+    //           handle, [self, device = this->device(), handle]() {
+    //             self->ReleaseXrtData(device, handle);
+    //           })) {}
+
     XrtData(XrtComputationClient* self, std::string device, Shape device_shape,
             int64_t handle)
         : Data(std::move(device), std::move(device_shape)),
           handle_ptr(std::make_shared<XrtHandle>(
-              handle, [self, device = this->device(), handle]() {
+              handle, [self, device = this->device()](int64_t handle) {
                 self->ReleaseXrtData(device, handle);
               })) {}
 
-    int64_t get_handle() const { return handle_ptr->handle; }
+    XrtData(XrtComputationClient* self, std::string device, Shape device_shape,
+            XrtHandlePtr handle)
+        : Data(std::move(device), std::move(device_shape)),
+          handle_ptr(handle) {}
+
+    int64_t get_handle() const { return handle_ptr->handle(); }
 
     OpaqueHandle GetOpaqueHandle() override { return get_handle(); }
 
@@ -81,12 +186,12 @@ class XrtComputationClient : public ComputationClient {
         : Computation(std::move(computation), std::move(program_shape),
                       std::move(devices)),
           handle_ptr(std::make_shared<XrtHandle>(
-              handle, [self, compilation_device = std::move(compilation_device),
-                       handle]() {
+              handle, [self, compilation_device = std::move(
+                                 compilation_device)](int64_t handle) {
                 self->ReleaseXrtComputation(compilation_device, handle);
               })) {}
 
-    int64_t get_handle() const { return handle_ptr->handle; }
+    int64_t get_handle() const { return handle_ptr->handle(); }
 
     XrtHandlePtr handle_ptr;
   };

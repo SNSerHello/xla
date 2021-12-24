@@ -314,8 +314,10 @@ class XLATensor::DeviceContextArena {
     DeviceContext* devctx = GetDeviceContext(device);
     std::lock_guard<std::mutex> lock(devctx->lock);
     if (!devctx->seed_ir_value) {
+      TF_VLOG(3) << "GetRngSeed upload";
       devctx->seed_ir_value =
           IrValueFromScalar(MakeIntScalar(devctx->seed), kSeedType, device);
+      TF_VLOG(3) << "GetRngSeed upload done";
     }
     // Keep the running seed as scalar as well, so we can return it directly
     // without executing graphs.
@@ -1412,6 +1414,7 @@ void XLATensor::SyncLiveTensorsGraph(const Device* device,
   TF_VLOG(4) << tensors.size() << " live tensors: devices=("
              << absl::StrJoin(devices, ",") << ")";
   SyncTensorsGraph(&tensors, devices, wait, /*sync_xla_data=*/true);
+  TF_VLOG(4) << "SyncLiveTensorsGraph done";
 }
 
 void XLATensor::MarkStep(const Device& device) {
